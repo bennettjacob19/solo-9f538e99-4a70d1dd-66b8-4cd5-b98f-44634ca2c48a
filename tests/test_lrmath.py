@@ -80,3 +80,17 @@ def test_bit_identical_repeat_runs():
 def test_sigmoid_stable_at_extremes():
     p = lr.sigmoid(np.array([-1000.0, 0.0, 1000.0]))
     assert p[0] == 0.0 and p[1] == 0.5 and p[2] == 1.0
+
+
+def test_predict_probability_matches_augmented_dot_product_and_threshold():
+    w = np.array([0.4, -1.1, 0.7])
+    x1, x2 = 0.8, -2.3
+    p = lr.predict_probability([x1, x2], w)
+    expected = float(lr.sigmoid(np.array([w @ np.array([1.0, x1, x2])]))[0])
+    assert p == expected
+    # Both workers evaluate the identical expression -> bit-identical repeat.
+    assert lr.predict_probability([x1, x2], w) == p
+    # Fixed 0.5 threshold, inclusive on the boundary.
+    assert lr.classify(0.5) == 1
+    assert lr.classify(0.5 - 1e-12) == 0
+    assert lr.classify(1.0) == 1 and lr.classify(0.0) == 0

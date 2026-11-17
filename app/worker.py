@@ -25,6 +25,7 @@ it to the last *confirmed* round (possibly discarding an unconfirmed commit).
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import signal
 import time
@@ -163,6 +164,40 @@ class WorkerState:
             "from_round": self.round,
         }
 
+    # ------------------------------------------------------------------ predict
+    def predict(self, task_id: str, round_: int, w: list,
+                features: list) -> Dict[str, Any]:
+        """Score ONE new workpiece against weights supplied by the caller.
+
+        Prediction is deliberately fenced only by ``task_id`` (never by
+        ``gen``): the decision must keep working while training is paused or
+        after this process restarted and has not been re-prepared yet. The
+        coordinator passes the *confirmed* parameters captured when the
+        request was accepted, so any unconfirmed round this worker may have
+        persisted locally is irrelevant and never influences the result. This
+        call is read-only: it mutates neither the shard nor ``state.json``.
+        """
+        if self.task_id is None or self.x_aug is None:
+            raise HTTPException(status_code=410,
+                                detail="worker holds no task shard")
+        if task_id != self.task_id:
+            raise HTTPException(status_code=410,
+                                detail="task id mismatch (stale task)")
+        w_arr = np.asarray(w, dtype=np.float64)
+        if w_arr.shape != (lrmath.N_WEIGHTS,):
+            raise HTTPException(status_code=400,
+                                detail="weight vector must have 3 components")
+        probability = lrmath.predict_probability(features, w_arr)
+        if not math.isfinite(probability):
+            raise HTTPException(status_code=500,
+                                detail="non-finite probability computed")
+        return {
+            "worker_id": WORKER_ID, "task_id": task_id,
+            "round": int(round_),
+            "probability": probability,
+            "local_round": self.round,
+        }
+
     def commit(self, task_id: str, gen: int, round_: int,
                grad: list) -> Dict[str, Any]:
         self.check_fence(task_id, gen)
@@ -224,6 +259,13 @@ class CommitIn(BaseModel):
     grad: list
 
 
+class PredictIn(BaseModel):
+    task_id: str
+    round: int
+    w: list
+    features: list = Field(..., min_length=2, max_length=2)
+
+
 class DelayIn(BaseModel):
     seconds: float = Field(..., ge=0, le=120)
 
@@ -264,6 +306,17 @@ async def gradient(body: GradIn) -> Dict[str, Any]:
 async def commit(body: CommitIn) -> Dict[str, Any]:
     await STATE.inject_delay()
     return STATE.commit(body.task_id, body.gen, body.round, body.grad)
+
+
+@app.post("/predict")
+async def predict(body: PredictIn) -> Dict[str, Any]:
+    # No injected delay here: an inspection decision must stay fast even while
+    # artificial training delays are active. Read-only by construction.
+    if len(body.features) != 2 or not all(
+            isinstance(v, (int, float)) for v in body.features):
+        raise HTTPException(status_code=400,
+                            detail="features must be exactly two numbers")
+    return STATE.predict(body.task_id, body.round, body.w, body.features)
 
 
 @app.post("/delay")

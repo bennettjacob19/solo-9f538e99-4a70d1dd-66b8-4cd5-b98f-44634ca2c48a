@@ -31,9 +31,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 import lrmath
 from storage import (atomic_write_json, exists,
@@ -306,6 +306,94 @@ class DelayIn(BaseModel):
     seconds: float = Field(..., ge=0, le=120)
 
 
+class PredictIn(BaseModel):
+    x1: float
+    x2: float
+
+
+PREDICT_DECISION_THRESHOLD = 0.5
+
+
+async def _run_prediction(snapshot: Dict[str, Any],
+                          features: List[float]) -> Dict[str, Any]:
+    """Ask both workers to score the workpiece with the *accepted* snapshot.
+
+    A failed/timed-out/mismatching side never raises to the caller: the
+    decision degrades to ``needs_review`` and no single-side conclusion is
+    ever returned. Nothing here writes durable state or touches the training
+    loop, so an inspection request can never advance, roll back or pause
+    training.
+    """
+    payload = {
+        "task_id": snapshot["task_id"],
+        "round": snapshot["confirmed_round"],
+        "w": snapshot["w"],
+        "features": features,
+    }
+    r1, r2 = await asyncio.gather(
+        worker_call("worker1", "/predict", payload, tolerate=True),
+        worker_call("worker2", "/predict", payload, tolerate=True),
+    )
+    sides = {"worker1": r1, "worker2": r2}
+    reasons: List[str] = []
+    for wid, res in sides.items():
+        if "_error" in res:
+            reasons.append(f"{wid} 不可达或拒绝请求: {res['_error'][:160]}")
+            continue
+        if res.get("task_id") != snapshot["task_id"]:
+            reasons.append(f"{wid} 返回任务不一致")
+        if res.get("round") != snapshot["confirmed_round"]:
+            reasons.append(
+                f"{wid} 版本不符: 受理轮次={snapshot['confirmed_round']}, "
+                f"返回轮次={res.get('round')}")
+        p = res.get("probability")
+        if not isinstance(p, (int, float)) or not np.isfinite(p):
+            reasons.append(f"{wid} 返回概率非法: {p!r}")
+    p1, p2 = r1.get("probability"), r2.get("probability")
+    if ("_error" not in r1 and "_error" not in r2
+            and isinstance(p1, (int, float)) and isinstance(p2, (int, float))
+            and np.isfinite(p1) and np.isfinite(p2)
+            and float(p1) != float(p2)):
+        reasons.append(
+            f"两侧概率不一致: worker1={p1!r} worker2={p2!r}")
+
+    out: Dict[str, Any] = {
+        "task_id": snapshot["task_id"],
+        "confirmed_round": snapshot["confirmed_round"],
+        "features": features,
+        "threshold": PREDICT_DECISION_THRESHOLD,
+        "snapshot_taken_at": now_ms(),
+        "workers": {
+            wid: {
+                "ok": "_error" not in res,
+                "error": res.get("_error"),
+                "task_id": res.get("task_id"),
+                "round": res.get("round"),
+                "probability": res.get("probability"),
+                "local_round": res.get("local_round"),
+            }
+            for wid, res in sides.items()
+        },
+    }
+    if reasons:
+        out.update({
+            "verdict": "needs_review",
+            "classification": None,
+            "probability": None,
+            "reason": "；".join(reasons),
+        })
+        return out
+    probability = float(p1)  # both sides proved identical above
+    out.update({
+        "verdict": "classified",
+        "classification": lrmath.classify(
+            probability, PREDICT_DECISION_THRESHOLD),
+        "probability": probability,
+        "reason": None,
+    })
+    return out
+
+
 # ============================================================ application
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -347,6 +435,39 @@ async def status() -> JSONResponse:
     out["worker_live"] = CTX.worker_live
     out["weights_available"] = exists(LATEST_WEIGHTS)
     return JSONResponse(out)
+
+
+@app.post("/api/predict")
+async def predict(request: Request) -> JSONResponse:
+    job, st = require_job()
+    # Parse the raw body manually: a strict JSON token such as NaN/Infinity
+    # (rejected by standard clients anyway) must produce a clean 400, not a
+    # 500 from the framework's default validation-error serializer trying to
+    # echo the non-finite value back.
+    try:
+        body = await request.json()
+    except Exception as exc:  # noqa: BLE001 - malformed JSON body
+        raise HTTPException(400, f"invalid JSON body: {exc}")
+    try:
+        parsed = PredictIn(**(body if isinstance(body, dict) else {}))
+    except ValidationError:
+        raise HTTPException(400, "body must contain numeric x1 and x2")
+    if not (np.isfinite(parsed.x1) and np.isfinite(parsed.x2)):
+        raise HTTPException(400, "features must be finite numbers")
+    # Pin the task, the last CONFIRMED round and its confirmed weights BEFORE
+    # any network call. Whatever the workers do afterwards (persisting an
+    # unconfirmed next round, restarting, serving a stale generation) cannot
+    # change the parameters this decision is based on. The training loop only
+    # ever reassigns st["w"] (it never mutates the list in place), so the
+    # snapshot keeps referencing exactly the accepted weight vector.
+    snapshot = {
+        "task_id": st["task_id"],
+        "confirmed_round": int(st["confirmed_round"]),
+        "w": list(st["w"]),
+    }
+    result = await _run_prediction(
+        snapshot, [float(parsed.x1), float(parsed.x2)])
+    return JSONResponse(result)
 
 
 @app.post("/api/job")

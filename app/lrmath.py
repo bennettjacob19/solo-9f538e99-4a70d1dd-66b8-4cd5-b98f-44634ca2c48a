@@ -56,6 +56,26 @@ def probabilities(x_aug: np.ndarray, w: Sequence[float]) -> np.ndarray:
     return sigmoid(x_aug @ np.asarray(w, dtype=np.float64))
 
 
+def predict_probability(features: Sequence[float],
+                        w: Sequence[float]) -> float:
+    """Defect probability of one new workpiece with two numeric features.
+
+    The feature pair is augmented to ``[1.0, x1, x2]`` exactly like the
+    training data and scored with the supplied (already confirmed) weight
+    vector, so both independent worker processes evaluate the identical
+    expression and return bit-identical probabilities.
+    """
+    x = np.asarray([float(features[0]), float(features[1])],
+                   dtype=np.float64)
+    x_aug = augment(x)  # shape (1, 3)
+    return float(probabilities(x_aug, w)[0])
+
+
+def classify(probability: float, threshold: float = 0.5) -> int:
+    """Hard decision at the fixed 0.5 threshold: p >= 0.5 -> defect (1)."""
+    return 1 if float(probability) >= threshold else 0
+
+
 def bce_loss(x_aug: np.ndarray, y: np.ndarray, w: Sequence[float]) -> float:
     """Mean binary cross-entropy over a shard or the full dataset."""
     p = probabilities(x_aug, w)

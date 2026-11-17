@@ -62,6 +62,20 @@
   .err { color:var(--bad); font-size:12px; margin-top:8px; min-height:16px;}
   .hint { color:var(--muted); font-size:12px; margin-top:8px; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .verdict { border-radius:10px; padding:12px 14px; margin-top:12px;
+             border:1px solid var(--line); background:#121a2b; }
+  .verdict h3 { margin:0 0 8px; font-size:14px; }
+  .verdict.ok h3 { color:var(--ok); }
+  .verdict.review h3 { color:var(--warn); }
+  .verdict .kv { grid-template-columns: 110px 1fr; }
+  .tag-defect { color:#fff; background:var(--bad); padding:2px 10px;
+                border-radius:999px; font-weight:600; }
+  .tag-ok { color:#fff; background:var(--ok); padding:2px 10px;
+            border-radius:999px; font-weight:600; }
+  .tag-review { color:#1a1405; background:var(--warn); padding:2px 10px;
+                border-radius:999px; font-weight:600; }
+  .side-detail { font-size:11px; color:var(--muted); margin-top:4px;
+                 font-family:ui-monospace,Menlo,Consolas,monospace; }
 </style>
 </head>
 <body>
@@ -111,6 +125,22 @@
         <button class="danger" id="btnKill2">强杀 worker2（SIGKILL）</button>
       </div>
       <div class="hint">强杀后容器入口守护会重启进程；守护内旧 generation 消息将被拒绝（409）。</div>
+    </div>
+
+    <div class="card" style="margin-top:18px">
+      <h2>4 · 在线工件判定（训练中可用）</h2>
+      <label>数值特征 x1</label>
+      <input type="number" id="px1" step="any" placeholder="例如 1.25">
+      <label>数值特征 x2</label>
+      <input type="number" id="px2" step="any" placeholder="例如 -0.40">
+      <div class="row" style="margin-top:12px">
+        <button id="btnPredict">提交判定</button>
+      </div>
+      <div class="hint">提交瞬间固定当前任务与最后已确认轮次（含已确认权重），由两个
+        worker 分别用该版本计算缺陷概率；仅当两侧任务、轮次与概率完全一致时，才按
+        0.5 阈值给出分类。任一侧失联、版本不符或结果不一致一律显示“待复核”，
+        不返回单侧结论，也不改变训练进度。</div>
+      <div id="predictBox"></div>
     </div>
   </section>
 
@@ -296,6 +326,65 @@ $("btnKill1").onclick = async()=>{ await post("/api/workers/worker1/kill");
   pushLog("已强杀 worker1（SIGKILL）"); poll(); };
 $("btnKill2").onclick = async()=>{ await post("/api/workers/worker2/kill");
   pushLog("已强杀 worker2（SIGKILL）"); poll(); };
+
+function sideLine(name, s) {
+  if (!s) return `<div class="side-detail">${name}: 无响应</div>`;
+  if (!s.ok) return `<div class="side-detail">${name}: 不可达 — ${
+      (s.error||"").slice(0,90)}</div>`;
+  return `<div class="side-detail">${name}: 任务=${(s.task_id||"—").slice(0,8)} `
+       + `返回轮次=${s.round} 概率=${fmt(s.probability)} `
+       + `(worker本地轮次=${s.local_round})</div>`;
+}
+
+async function submitPredict() {
+  const x1 = parseFloat($("px1").value), x2 = parseFloat($("px2").value);
+  const box = $("predictBox");
+  if (!Number.isFinite(x1) || !Number.isFinite(x2)) {
+    box.innerHTML = `<div class="verdict review"><h3>输入无效</h3>
+      <div class="hint">请填写两个有限数值特征。</div></div>`;
+    return;
+  }
+  box.innerHTML = `<div class="hint" style="margin-top:10px">判定中…</div>`;
+  let d;
+  try {
+    d = await post("/api/predict", {x1, x2});
+  } catch(e) {
+    box.innerHTML = `<div class="verdict review"><h3>待复核</h3>
+      <div class="hint">请求失败：${e.message}</div></div>`;
+    return;
+  }
+  const w = d.workers || {};
+  const sides = sideLine("worker1", w.worker1) + sideLine("worker2", w.worker2);
+  const base = `<div class="kv">
+      <div class="k">受理任务</div><div>${(d.task_id||"—").slice(0,8)}</div>
+      <div class="k">已确认轮次（版本）</div><div>${d.confirmed_round}</div>
+      <div class="k">输入特征</div><div>${d.features[0]}, ${d.features[1]}</div>
+      <div class="k">阈值</div><div>${d.threshold}</div>
+    </div>${sides}`;
+  if (d.verdict === "classified") {
+    const defect = d.classification === 1;
+    box.innerHTML = `<div class="verdict ok">
+      <h3>判定结果：
+        <span class="${defect?"tag-defect":"tag-ok"}">${
+          defect ? "缺陷 (1)" : "正常 (0)"}</span></h3>
+      ${base}
+      <div class="kv" style="margin-top:8px">
+        <div class="k">缺陷概率</div><div>${fmt(d.probability)}</div>
+        <div class="k">两侧一致性</div><div>任务 / 轮次 / 概率均一致</div>
+      </div></div>`;
+    pushLog(`判定完成: 版本轮次=${d.confirmed_round} p=${fmt(d.probability)} `
+          + `=> ${defect ? "缺陷" : "正常"}`);
+  } else {
+    box.innerHTML = `<div class="verdict review">
+      <h3>待复核 <span class="tag-review">needs_review</span></h3>
+      ${base}
+      <div class="hint" style="margin-top:8px; color:var(--warn)">${
+        d.reason || "双侧结果无法达成一致"}</div>
+      <div class="hint">未返回任何单侧结论，训练进度未改变。</div></div>`;
+    pushLog(`判定待复核: ${d.reason || "双侧不一致"}（轮次=${d.confirmed_round}）`);
+  }
+}
+$("btnPredict").onclick = submitPredict;
 
 poll();
 pollTimer = setInterval(poll, 1200);
